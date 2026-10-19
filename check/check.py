@@ -15,12 +15,18 @@ PROM = os.environ.get("PROM_URL", "http://prometheus:9090")
 RULES_DIR = "/rules"
 LOG = "/state/fault.log"
 KST = timezone(timedelta(hours=9))
+STEP = 5
 KEYWORDS = {"by", "without", "on", "ignoring", "group_left", "group_right",
             "bool", "offset", "and", "or", "unless", "inf", "nan"}
 
 
 def kst(ts):
     return datetime.fromtimestamp(ts, KST).strftime("%H:%M:%S")
+
+
+def fmt(sec):
+    m, s = divmod(int(round(sec)), 60)
+    return f"{m}분 {s}초"
 
 
 def api(path, params=None):
@@ -141,6 +147,16 @@ def check_rules():
     return 0 if ok else 1
 
 
+def episodes(times):
+    out = []
+    for t in sorted(times):
+        if out and t - out[-1][1] <= STEP * 2:
+            out[-1][1] = t
+        else:
+            out.append([t, t])
+    return [(a, b + STEP) for a, b in out]
+
+
 def result():
     if not os.path.exists(LOG):
         print("장애 기록이 없음. fault start를 먼저 실행.")
@@ -158,32 +174,57 @@ def result():
         return 1
 
     fault_on = on["ts"]
-    series = api("/api/v1/query_range", {
-        "query": 'ALERTS{alertstate="firing"}',
-        "start": armed["start"] - 600,
-        "end": min(time.time(), armed["end"] + 300),
-        "step": 5,
-    })["result"]
-
-    fired = {}
-    for s in series:
-        name = s["metric"]["alertname"]
-        first = float(s["values"][0][0])
-        fired[name] = min(first, fired.get(name, first))
+    fault_end = armed["end"]
+    total = fault_end - fault_on
 
     print(f"장애 켜짐: {kst(fault_on)} (예약보다 {on.get('late_by_s', 0)}초 늦음)")
-    print(f"장애 끝:   {kst(armed['end'])}\n")
-    names = sorted({r["name"] for r in loaded_rules().values()} | set(fired))
-    for name in names:
-        if name not in fired:
-            print(f"   {name}: 안 울림")
-            continue
-        t = fired[name]
-        if t < fault_on:
-            print(f"   {name}: 장애 전에 울림 {kst(t)} (오탐 의심)")
-        else:
-            m, s = divmod(int(round(t - fault_on)), 60)
-            print(f"   {name}: 울림, 장애 시작 후 {m}분 {s}초 ({kst(t)})")
+    print(f"장애 끝:   {kst(fault_end)} (총 {fmt(total)})")
+
+    covered = api("/api/v1/query_range", {
+        "query": 'up{job="prometheus"}',
+        "start": fault_on, "end": fault_on + 60, "step": STEP,
+    })["result"]
+    if not covered:
+        print("\n경고: 장애가 켜진 시각의 Prometheus 기록이 없음.")
+        print("      기록이 지워졌거나 그때 Prometheus가 꺼져 있었음. 판정할 수 없음.")
+        return 1
+    if time.time() < fault_end:
+        print("\n참고: 장애가 아직 진행 중이라 중간 결과임.")
+
+    series = api("/api/v1/query_range", {
+        "query": "ALERTS",
+        "start": armed["start"] - 600,
+        "end": min(time.time(), fault_end + 300),
+        "step": STEP,
+    })["result"]
+    times = {}
+    for s in series:
+        key = (s["metric"]["alertname"], s["metric"].get("alertstate"))
+        times.setdefault(key, set()).update(float(v[0]) for v in s["values"])
+
+    rules = {r["name"]: r for r in loaded_rules().values()}
+    for name in sorted(set(rules) | {k[0] for k in times}):
+        fire = episodes(times.get((name, "firing"), ()))
+        pend = episodes(times.get((name, "pending"), ()))
+        before = [e for e in fire if e[0] < fault_on]
+        during = [e for e in fire if fault_on <= e[0] <= fault_end]
+        print(f"\n   {name}")
+        if before:
+            print(f"      장애 전에 울림 {kst(before[0][0])} (오탐 의심)")
+        if during:
+            first = during[0][0]
+            rang = sum(min(b, fault_end) - max(a, fault_on)
+                       for a, b in fire if b > fault_on and a < fault_end)
+            print(f"      첫 울림: 장애 시작 후 {fmt(first - fault_on)} ({kst(first)})")
+            print(f"      울림 {len(during)}회 · 장애 중 울린 시간 {fmt(rang)} / {fmt(total)} ({rang / total:.0%})")
+            print(f"      Pending {len(pend)}회")
+        elif not before:
+            hold = rules.get(name, {}).get("duration", 0)
+            if pend:
+                longest = max(b - a for a, b in pend)
+                print(f"      안 울림 · Pending {len(pend)}회, 가장 길게 {fmt(longest)} (for {fmt(hold)}를 못 채움)")
+            else:
+                print("      안 울림 · Pending도 없음 (조건이 한 번도 참이 안 됨)")
     print("\n오차: 룰 평가 간격(15초) 이내")
     return 0
 
