@@ -49,5 +49,13 @@ services:
     profiles: ["tools"]
     volumes:
       - faultstate:/state
+  check:
+    build: ./check
+    profiles: ["tools"]
+    environment:
+      - PROM_URL=http://prometheus:9090
+    volumes:
+      - ./prometheus/rules:/rules:ro
+      - faultstate:/state:ro
 volumes:
   faultstate:
