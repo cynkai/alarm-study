@@ -206,6 +206,8 @@ def result():
     for name in sorted(set(rules) | {k[0] for k in times}):
         fire = episodes(times.get((name, "firing"), ()))
         pend = episodes(times.get((name, "pending"), ()))
+        pend_before = [e for e in pend if e[0] < fault_on]
+        pend_during = [e for e in pend if fault_on <= e[0] <= fault_end]
         before = [e for e in fire if e[0] < fault_on]
         during = [e for e in fire if fault_on <= e[0] <= fault_end]
         print(f"\n   {name}")
@@ -217,14 +219,16 @@ def result():
                        for a, b in fire if b > fault_on and a < fault_end)
             print(f"      첫 울림: 장애 시작 후 {fmt(first - fault_on)} ({kst(first)})")
             print(f"      울림 {len(during)}회 · 장애 중 울린 시간 {fmt(rang)} / {fmt(total)} ({rang / total:.0%})")
-            print(f"      Pending {len(pend)}회")
+            print(f"      Pending {len(pend_during)}회")
         elif not before:
             hold = rules.get(name, {}).get("duration", 0)
-            if pend:
-                longest = max(b - a for a, b in pend)
-                print(f"      안 울림 · Pending {len(pend)}회, 가장 길게 {fmt(longest)} (for {fmt(hold)}를 못 채움)")
+            if pend_during:
+                longest = max(b - a for a, b in pend_during)
+                print(f"      안 울림 · 장애 중 Pending {len(pend_during)}회, 가장 길게 {fmt(longest)} (for {fmt(hold)}를 못 채움)")
             else:
-                print("      안 울림 · Pending도 없음 (조건이 한 번도 참이 안 됨)")
+                print("      안 울림 · 장애 중 Pending 없음 (장애 중 조건이 한 번도 참이 안 됨)")
+        if pend_before:
+            print(f"      (장애 전 10분: Pending {len(pend_before)}회 — 이전 장애 영향 의심)")
     print("\n오차: 룰 평가 간격(15초) 이내")
     return 0
 
