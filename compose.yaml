@@ -27,3 +27,7 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
       - "127.0.0.1:3000:3000"
+  app:
+    build: ./app
+    ports:
+      - "127.0.0.1:8000:8000"
