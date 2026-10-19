@@ -7,6 +7,7 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
     ports:
       - "127.0.0.1:9090:9090"
   alertmanager:
@@ -59,3 +60,4 @@ services:
       - faultstate:/state:ro
 volumes:
   faultstate:
+  promdata:
