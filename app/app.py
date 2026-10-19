@@ -114,5 +114,15 @@ def metrics():
     return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
 
 
+def init_series():
+    for target in ("stock", "payment"):
+        for result in ("ok", "error", "timeout"):
+            UPSTREAM_REQUESTS.labels(target, result)
+    for endpoint, method in (("/", "GET"), ("/products", "GET"), ("/checkout", "POST")):
+        for status in ("200", "502"):
+            REQUESTS.labels(endpoint, method, status)
+
+
 if __name__ == "__main__":
+    init_series()
     app.run(host="0.0.0.0", port=8000, threaded=True)

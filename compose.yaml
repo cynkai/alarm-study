@@ -35,6 +35,8 @@ services:
       - "127.0.0.1:8000:8000"
   payments:
     build: ./payments
+    volumes:
+      - faultstate:/state
   loadgen:
     build: ./loadgen
     environment:
@@ -42,3 +44,10 @@ services:
       - RPS=5
     depends_on:
       - app
+  fault:
+    build: ./fault
+    profiles: ["tools"]
+    volumes:
+      - faultstate:/state
+volumes:
+  faultstate:
