@@ -57,10 +57,19 @@ def schedule(s):
 def encode():
     s = json.load(sys.stdin)
     validate(s)
+    at = s.get("at", "now")
+    if isinstance(at, str) and at.startswith("+"):
+        target = time.time() + int(at[1:])
+        s["at"] = datetime.fromtimestamp(target, KST).replace(microsecond=0).isoformat()
     raw = json.dumps(s, separators=(",", ":")).encode()
     code = base64.urlsafe_b64encode(raw).decode()
-    print(code)
-    print("sha256:", hashlib.sha256(code.encode()).hexdigest(), file=sys.stderr)
+    digest = hashlib.sha256(code.encode()).hexdigest()
+    if s.get("at", "now") != "now":
+        print(f"예약 시각: {kst(schedule(s))}")
+    print(f"봉인(sha256): {digest}")
+    print()
+    print("아래 한 줄을 그대로 복사해서 실행:")
+    print(f"docker compose run --rm fault start {code}")
 
 
 def start(code):
