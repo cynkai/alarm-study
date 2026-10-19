@@ -1,0 +1,15 @@
+groups:
+  - name: kit
+    rules:
+      - alert: AppErrorRateHigh
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1m]))
+            /
+          sum(rate(http_requests_total[1m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          owner: kit
+        annotations:
+          summary: "앱 전체 에러율 {{ $value | humanizePercentage }}"
