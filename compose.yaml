@@ -29,5 +29,16 @@ services:
       - "127.0.0.1:3000:3000"
   app:
     build: ./app
+    environment:
+      - PAYMENTS_URL=http://payments:9000
     ports:
       - "127.0.0.1:8000:8000"
+  payments:
+    build: ./payments
+  loadgen:
+    build: ./loadgen
+    environment:
+      - TARGET=http://app:8000
+      - RPS=5
+    depends_on:
+      - app
