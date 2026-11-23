@@ -9,13 +9,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-import yaml
-
 PROM = os.environ.get("PROM_URL", "http://prometheus:9090")
 RULES_DIR = "/rules"
 LOG = "/state/fault.log"
 KST = timezone(timedelta(hours=9))
 STEP = 5
+SELF_SCRAPE_INTERVAL = 15  # prometheus/prometheus.yml
 KEYWORDS = {"by", "without", "on", "ignoring", "group_left", "group_right",
             "bool", "offset", "and", "or", "unless", "inf", "nan"}
 
@@ -49,6 +48,8 @@ def rule_files():
 
 
 def alert_rules(path):
+    import yaml
+
     with open(path) as f:
         doc = yaml.safe_load(f) or {}
     out = []
@@ -150,11 +151,27 @@ def check_rules():
 def episodes(times):
     out = []
     for t in sorted(times):
-        if out and t - out[-1][1] <= STEP * 2:
+        if out and round(t - out[-1][1], 3) <= STEP:
             out[-1][1] = t
         else:
             out.append([t, t])
     return [(a, b + STEP) for a, b in out]
+
+
+def has_prometheus_coverage(start, end):
+    # A range query can reuse the last sample after scraping has stopped.
+    # Require a successful self-scrape within two configured scrape intervals.
+    up = 'up{job="prometheus"}'
+    query = f"{up} == 1 and (time() - timestamp({up}) <= {2 * SELF_SCRAPE_INTERVAL})"
+    series = api("/api/v1/query_range", {
+        "query": query, "start": start, "end": end, "step": STEP,
+    })["result"]
+    healthy = {
+        round(float(ts) * 1000)
+        for s in series for ts, value in s["values"] if float(value) == 1
+    }
+    expected = range(round(start * 1000), round(end * 1000), STEP * 1000)
+    return all(ts in healthy for ts in expected)
 
 
 def result():
@@ -168,68 +185,84 @@ def result():
         print("예약된 장애가 없음")
         return 1
     armed = events[armed_at[-1]]
-    on = next((e for e in events[armed_at[-1] + 1:] if e["event"] == "on"), None)
-    if on is None:
+    recent = events[armed_at[-1] + 1:]
+    first_transition = next((e for e in recent if e["event"] in {"on", "stopped"}), None)
+    if first_transition is None:
         print("장애가 아직 켜지지 않음")
         return 1
+    if first_transition["event"] == "stopped":
+        print("장애가 켜지기 전에 취소됨")
+        return 1
 
+    on = first_transition
     fault_on = on["ts"]
-    fault_end = armed["end"]
-    total = fault_end - fault_on
+    ended = [e["ts"] for e in recent if e["event"] in {"off", "stopped"} and e["ts"] >= fault_on]
+    fault_end = min(armed["end"], *ended) if ended else armed["end"]
+    now = time.time()
+    observed_end = min(now, fault_end)
+    total = observed_end - fault_on
+    if total <= 0:
+        print("집계할 장애 시간이 없음")
+        return 1
 
     print(f"장애 켜짐: {kst(fault_on)} (예약보다 {on.get('late_by_s', 0)}초 늦음)")
-    print(f"장애 끝:   {kst(fault_end)} (총 {fmt(total)})")
+    if now < fault_end:
+        print(f"중간 결과: {kst(observed_end)}까지 ({fmt(total)} 경과, 종료 예정 {kst(fault_end)})")
+    else:
+        print(f"장애 끝:   {kst(fault_end)} (총 {fmt(total)})")
 
-    covered = api("/api/v1/query_range", {
-        "query": 'up{job="prometheus"}',
-        "start": fault_on, "end": fault_on + 60, "step": STEP,
-    })["result"]
-    if not covered:
-        print("\n경고: 장애가 켜진 시각의 Prometheus 기록이 없음.")
-        print("      기록이 지워졌거나 그때 Prometheus가 꺼져 있었음. 판정할 수 없음.")
+    if not has_prometheus_coverage(fault_on, observed_end):
+        print("\n경고: 집계 구간에 정상 Prometheus 자체 수집 기록이 빠져 있음.")
+        print("      이 구간의 알람 발생 여부와 지속 시간을 판정할 수 없음.")
         return 1
-    if time.time() < fault_end:
-        print("\n참고: 장애가 아직 진행 중이라 중간 결과임.")
 
     series = api("/api/v1/query_range", {
         "query": "ALERTS",
-        "start": armed["start"] - 600,
-        "end": min(time.time(), fault_end + 300),
+        "start": fault_on - 600,
+        "end": observed_end,
         "step": STEP,
     })["result"]
     times = {}
     for s in series:
         key = (s["metric"]["alertname"], s["metric"].get("alertstate"))
-        times.setdefault(key, set()).update(float(v[0]) for v in s["values"])
+        for ts, _ in s["values"]:
+            timestamp = float(ts)
+            if timestamp < observed_end:
+                times.setdefault(key, set()).add(timestamp)
 
     rules = {r["name"]: r for r in loaded_rules().values()}
     for name in sorted(set(rules) | {k[0] for k in times}):
         fire = episodes(times.get((name, "firing"), ()))
         pend = episodes(times.get((name, "pending"), ()))
         pend_before = [e for e in pend if e[0] < fault_on]
-        pend_during = [e for e in pend if fault_on <= e[0] <= fault_end]
+        pend_during = [e for e in pend if fault_on <= e[0] < observed_end]
         before = [e for e in fire if e[0] < fault_on]
-        during = [e for e in fire if fault_on <= e[0] <= fault_end]
+        continuing = any(b > fault_on for _, b in before)
+        during = [e for e in fire if fault_on <= e[0] < observed_end]
         print(f"\n   {name}")
         if before:
-            print(f"      장애 전에 울림 {kst(before[0][0])} (오탐 의심)")
+            print(f"      장애 전에도 울림 관측 ({kst(before[0][0])})")
+        if continuing:
+            print("      장애 시작 전부터 이어진 울림 있음")
         if during:
             first = during[0][0]
-            rang = sum(min(b, fault_end) - max(a, fault_on)
-                       for a, b in fire if b > fault_on and a < fault_end)
-            print(f"      첫 울림: 장애 시작 후 {fmt(first - fault_on)} ({kst(first)})")
-            print(f"      울림 {len(during)}회 · 장애 중 울린 시간 {fmt(rang)} / {fmt(total)} ({rang / total:.0%})")
-            print(f"      Pending {len(pend_during)}회")
-        elif not before:
-            hold = rules.get(name, {}).get("duration", 0)
-            if pend_during:
-                longest = max(b - a for a, b in pend_during)
-                print(f"      안 울림 · 장애 중 Pending {len(pend_during)}회, 가장 길게 {fmt(longest)} (for {fmt(hold)}를 못 채움)")
-            else:
-                print("      안 울림 · 장애 중 Pending 없음 (장애 중 조건이 한 번도 참이 안 됨)")
+            print(f"      첫 새 울림: 장애 시작 후 {fmt(first - fault_on)} ({kst(first)})")
+        if during or continuing:
+            rang = sum(min(b, observed_end) - max(a, fault_on)
+                       for a, b in fire if b > fault_on and a < observed_end)
+            print(f"      새 울림 {len(during)}회 · 장애 중 울린 시간 {fmt(rang)} / {fmt(total)} ({rang / total:.0%})")
+        elif pend_during:
+            print("      장애 중 울림 없음 · Pending 기록만 있음")
+        else:
+            print("      장애 중 울림 없음")
+        if pend_during:
+            longest = max(min(b, observed_end) - a for a, b in pend_during)
+            hold = rules.get(name, {}).get("duration")
+            setting = f" (설정 for {fmt(hold)})" if hold is not None else ""
+            print(f"      장애 중 시작된 Pending {len(pend_during)}회 · 가장 길게 {fmt(longest)}{setting}")
         if pend_before:
-            print(f"      (장애 전 10분: Pending {len(pend_before)}회 — 이전 장애 영향 의심)")
-    print("\n오차: 룰 평가 간격(15초) 이내")
+            print(f"      장애 전 10분 동안 Pending {len(pend_before)}회 관측")
+    print("\n시간은 5초 간격으로 조회한 근사값이며, 룰 평가 간격의 영향을 받음.")
     return 0
 
 
