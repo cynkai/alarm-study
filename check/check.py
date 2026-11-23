@@ -1,7 +1,6 @@
 import glob
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -15,8 +14,6 @@ LOG = "/state/fault.log"
 KST = timezone(timedelta(hours=9))
 STEP = 5
 SELF_SCRAPE_INTERVAL = 15  # prometheus/prometheus.yml
-KEYWORDS = {"by", "without", "on", "ignoring", "group_left", "group_right",
-            "bool", "offset", "and", "or", "unless", "inf", "nan"}
 
 
 def kst(ts):
@@ -70,26 +67,24 @@ def loaded_rules():
     return found
 
 
-def metric_names(expr):
-    e = re.sub(r'"(?:[^"\\]|\\.)*"', " ", expr)
-    e = re.sub(r"'(?:[^'\\]|\\.)*'", " ", e)
-    e = re.sub(r"\{[^}]*\}", " ", e)
-    e = re.sub(r"\[[^\]]*\]", " ", e)
-    e = re.sub(r"\b(by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", " ", e)
-    names = set()
-    for m in re.finditer(r"[A-Za-z_:][A-Za-z0-9_:]*", e):
-        if e[m.end():].lstrip().startswith("("):
-            continue
-        if m.group(0).lower() in KEYWORDS:
-            continue
-        names.add(m.group(0))
-    return names
+def metric_names(node):
+    if isinstance(node, list):
+        for child in node:
+            yield from metric_names(child)
+    elif isinstance(node, dict):
+        if node.get("type") in {"vectorSelector", "matrixSelector"}:
+            for matcher in node["matchers"]:
+                if matcher["name"] == "__name__" and matcher["type"] == "=" and matcher["value"]:
+                    yield matcher["value"]
+        else:
+            for child in node.values():
+                yield from metric_names(child)
 
 
 def check_rules():
     files = rule_files()
     if not files:
-        print("룰 파일이 없음 (prometheus/rules/*.yml)")
+        print("룰 파일이 없음 (prometheus/rules/의 .yml 또는 .yaml)")
         return 1
 
     print("1) 문법")
@@ -107,8 +102,11 @@ def check_rules():
         print("\n문법 오류가 있어서 여기서 멈춤. 고친 뒤 다시 실행.")
         return 1
 
-    reload_prometheus()
     expected = [(os.path.basename(f), g, a, e) for f in files for g, a, e in alert_rules(f)]
+    if not expected:
+        print("\n알람 룰이 없음. rules에 alert 항목을 추가한 뒤 다시 실행.")
+        return 1
+    reload_prometheus()
 
     print("\n2) 로드 (Prometheus가 실제로 읽었나)")
     deadline = time.time() + 45
@@ -131,17 +129,18 @@ def check_rules():
         else:
             print(f"   통과  {a}")
 
-    print("\n3) 지표 존재 (룰이 참조하는 지표가 실제로 있나)")
+    print("\n3) 지표 존재 (룰이 이름으로 지정한 지표가 실제로 있나)")
     known = set(api("/api/v1/label/__name__/values"))
     metric_ok = True
     for _, _, a, expr in expected:
-        names = metric_names(expr)
+        parsed = api("/api/v1/parse_query", {"query": expr})
+        names = set(metric_names(parsed))
         missing = sorted(n for n in names if n not in known)
         if missing:
             metric_ok = False
             print(f"   실패  {a}: 없는 지표 {', '.join(missing)}")
         else:
-            print(f"   통과  {a}: {', '.join(sorted(names))}")
+            print(f"   통과  {a}: {', '.join(sorted(names)) or '고정 지표명 없음'}")
 
     ok = load_ok and metric_ok
     print("\n결과:", "모두 통과" if ok else "실패 항목 있음")
